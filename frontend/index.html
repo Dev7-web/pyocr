@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Doc Pipeline Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <div class="ambient-shape shape-a"></div>
+  <div class="ambient-shape shape-b"></div>
+
+  <header class="topbar reveal">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span class="brand-text">Doc Pipeline Studio</span>
+    </div>
+    <div class="status-pill" id="healthPill">Checking backend...</div>
+  </header>
+
+  <main class="layout">
+    <section class="panel upload-panel reveal">
+      <h1>Process Documents End-to-End</h1>
+      <p>Upload a file and the backend runs extract, metadata generation, and index build automatically.</p>
+
+      <form id="uploadForm" class="upload-form">
+        <label class="file-input-wrap">
+          <input id="fileInput" type="file" accept=".pdf,.pptx,.docx,.csv,.xlsx,.xls" required />
+          <span id="fileLabel">Choose PDF / PPTX / DOCX / CSV / XLSX</span>
+        </label>
+        <button id="uploadBtn" type="submit">Start Pipeline</button>
+      </form>
+      <p class="hint">No CLI workflow needed after launch. All actions run from this UI.</p>
+    </section>
+
+    <section class="panel progress-panel reveal">
+      <div class="panel-header">
+        <h2>Pipeline Job</h2>
+        <span id="jobIdBadge" class="mono subtle">No job yet</span>
+      </div>
+      <div class="progress-wrap">
+        <div id="progressBar" class="progress-bar"></div>
+      </div>
+      <div class="status-grid">
+        <div>
+          <div class="label">Status</div>
+          <div id="jobStatus">idle</div>
+        </div>
+        <div>
+          <div class="label">Stage</div>
+          <div id="jobStage">-</div>
+        </div>
+        <div>
+          <div class="label">Progress</div>
+          <div id="jobProgress">0%</div>
+        </div>
+      </div>
+      <div id="jobMessage" class="message">Upload a document to begin.</div>
+      <div id="jobError" class="error"></div>
+    </section>
+
+    <section class="panel summary-panel reveal">
+      <h2>Extraction Summary</h2>
+      <div class="cards">
+        <article class="metric-card">
+          <span class="metric-label">Texts</span>
+          <span id="metricTexts" class="metric-value">0</span>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Tables</span>
+          <span id="metricTables" class="metric-value">0</span>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Images</span>
+          <span id="metricImages" class="metric-value">0</span>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Warnings</span>
+          <span id="metricWarnings" class="metric-value">0</span>
+        </article>
+      </div>
+      <div id="summaryNote" class="hint">Summary appears after the pipeline completes.</div>
+    </section>
+
+    <section class="panel search-panel reveal">
+      <div class="panel-header">
+        <h2>Semantic Image Search</h2>
+        <span class="mono subtle">Hybrid by default</span>
+      </div>
+      <form id="searchForm" class="search-form">
+        <input id="queryInput" type="text" placeholder="e.g. wiring diagram for motor controller" required />
+        <select id="searchMode">
+          <option value="hybrid">hybrid</option>
+          <option value="image_only">image_only</option>
+          <option value="text_only">text_only</option>
+        </select>
+        <input id="topKInput" type="number" min="1" max="20" value="5" />
+        <button type="submit">Search</button>
+      </form>
+      <p class="hint">Search activates after a job finishes indexing.</p>
+    </section>
+
+    <section class="panel gallery-panel reveal">
+      <div class="panel-header">
+        <h2>Image Results</h2>
+        <span id="resultCount" class="mono subtle">0 items</span>
+      </div>
+      <div id="resultGrid" class="result-grid"></div>
+    </section>
+  </main>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
