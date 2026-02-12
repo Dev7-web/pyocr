@@ -1,90 +1,106 @@
-# Doc Pipeline Studio
+## Doc Pipeline Studio – Run Guide
 
-Local-first document processing and semantic image retrieval with both:
+Local‑first document processing and semantic image retrieval, now split cleanly into **backend** and **frontend**.
 
-- a **backend API** (job orchestration + search)
-- a **frontend dashboard** (upload, progress tracking, results gallery, semantic search)
+- **Backend** (Python, FastAPI, pipeline): `backend/`
+- **Frontend** (static UI): `frontend/`
 
-You can run the complete workflow from the browser without manually chaining CLI commands.
-
-## What It Does
-
-Given a document (`PDF`, `PPTX`, `DOCX`, `CSV`, `XLSX/XLS`), the pipeline:
-
-1. Extracts text blocks, tables, and images.
-2. Detects vector-heavy PDF drawings and renders them as diagram images.
-3. Generates image metadata using a local vision-model strategy + OCR fallback.
-4. Builds local CLIP embeddings (`image`, `text`, `hybrid`) and stores them in `.npz`.
-5. Supports semantic image search using cosine similarity.
-
-No database, Redis, background worker service, or external API is required.
-
-## Project Layout
+### Project layout
 
 ```text
-.
-├── app.py                     # One-command web app launcher
-├── main.py                    # CLI entrypoint (still available)
-├── webapp/
-│   ├── app.py                 # FastAPI backend + static serving
-│   └── job_manager.py         # Async job orchestration
+pyocr/
+├── backend/
+│   ├── app.py              # Web app launcher (uvicorn wrapper)
+│   ├── main.py             # CLI entrypoint
+│   ├── requirements.txt    # Backend dependencies
+│   ├── webapp/
+│   │   ├── app.py          # FastAPI app
+│   │   └── job_manager.py  # Job orchestration
+│   ├── extractors/         # PDF / PPTX / DOCX / spreadsheet extractors
+│   ├── image_processing/   # Embeddings + metadata generation
+│   ├── models/             # Pydantic data models
+│   ├── search/             # Semantic search
+│   └── utils/              # Helpers, logging, file I/O
 ├── frontend/
-│   ├── index.html             # Dashboard UI
+│   ├── index.html          # Dashboard UI
 │   ├── styles.css
 │   └── app.js
-├── extractors/
-├── image_processing/
-├── search/
-├── models/
-├── utils/
-└── tests/
+└── README.md               # This file
 ```
 
-## Quick Start (Web App)
+### 1. Environment setup
+
+- **Python**: 3.10+ recommended.
+- From the **project root** (`pyocr/`), create and activate a virtualenv:
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-python app.py
+.venv\Scripts\activate           # on Windows PowerShell
 ```
 
-Open:
-
-- `http://127.0.0.1:8000`
-
-From the UI:
-
-1. Upload a document.
-2. Wait for pipeline completion status.
-3. Run semantic queries in the search section.
-
-## CLI Mode (Optional)
-
-CLI remains available if needed:
+- Install backend dependencies (includes `uvicorn`, `fastapi`, etc.):
 
 ```bash
-python main.py pipeline --file report.pdf --output ./output
-python main.py search --index ./output/report_pdf --query "circuit diagram"
+pip install -r backend/requirements.txt
 ```
 
-## API Endpoints
+If you previously saw `ModuleNotFoundError: No module named 'uvicorn'`, this step fixes it.
+
+### 2. Run the web app (backend API + frontend UI)
+
+From the **project root** (`pyocr/`) with the venv activated:
+
+```bash
+python -m backend.app
+```
+
+This runs `uvicorn` with the FastAPI app defined in `backend/webapp/app.py`. Then open:
+
+- `http://127.0.0.1:8000` – main UI
+
+From the browser:
+
+1. Upload a supported document (`PDF`, `PPTX`, `DOCX`, `CSV`, `XLSX/XLS`).
+2. Wait until the job status becomes **completed**.
+3. Run semantic image searches in the search panel.
+
+### 3. CLI usage (processing without the web UI)
+
+Always invoke the CLI as a **module** from the project root so imports stay correct:
+
+```bash
+# Extract only
+python -m backend.main extract --file sample.csv --output backend/output
+
+# Full pipeline (extract + metadata + index)
+python -m backend.main pipeline --file sample.csv --output backend/output
+
+# Build index for an existing extracted document directory
+python -m backend.main build-index --input backend/output/<document_folder>
+
+# Search an existing index
+python -m backend.main search --index backend/output/<document_folder> --query "circuit diagram"
+```
+
+> Note: Avoid running `python main.py` directly from inside `backend/`, because that bypasses the package context and can cause import errors. Use `python -m backend.main` from the project root instead.
+
+### 4. Key API endpoints (when the web app is running)
 
 - `GET /api/health`
-- `POST /api/upload` (multipart file upload)
-- `GET /api/jobs`
-- `GET /api/jobs/{job_id}`
-- `GET /api/jobs/{job_id}/result`
-- `GET /api/jobs/{job_id}/gallery`
-- `POST /api/jobs/{job_id}/search`
-- `DELETE /api/jobs/{job_id}`
+- `POST /api/upload` – upload a document (multipart form)
+- `GET /api/jobs` – list jobs
+- `GET /api/jobs/{job_id}` – job status/details
+- `GET /api/jobs/{job_id}/result` – extraction result JSON
+- `GET /api/jobs/{job_id}/gallery` – image gallery metadata
+- `POST /api/jobs/{job_id}/search` – semantic image search
+- `DELETE /api/jobs/{job_id}` – delete job + artifacts
 
-## Output
+### 5. Output structure
 
-Per job, artifacts are saved under:
+Per processed document/job, artifacts are stored under `backend/output/`:
 
 ```text
-output/<job_id>/<document_name_ext>/
+backend/output/<job_id>/<document_name_ext>/
 ├── extraction_result.json
 ├── texts/full_text.txt
 ├── tables/*.csv
@@ -93,13 +109,18 @@ output/<job_id>/<document_name_ext>/
 └── embeddings.npz
 ```
 
-## Optional System Dependencies
+### 6. Optional system dependencies
 
-- **Tesseract OCR** binary for better `detected_text` in images.
-- **LibreOffice** for PPTX chart/SmartArt fallback rendering.
+For best results, install:
 
-## Testing
+- **Tesseract OCR** – used by `pytesseract` for better image text extraction.
+- **LibreOffice** – used as a fallback to render complex PPTX charts/SmartArt to images.
+
+### 7. Running tests (if/when you add them back)
+
+From the project root with the venv active:
 
 ```bash
 pytest -q
 ```
+
