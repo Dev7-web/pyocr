@@ -14,8 +14,12 @@ from models.data_models import ExtractionResult, ImageMetadata
 from utils.helpers import extract_source_context, setup_logger
 
 VISION_PROMPT = (
-    "Describe this image in detail. Include image type (photo, diagram, chart, schematic, etc.), "
-    "visible objects/elements, text in the image, relationships between elements, and likely purpose."
+    "Analyze this image and provide the following:\n\n"
+    "DESCRIPTION: Describe this image in detail. Include the image type "
+    "(photo, diagram, chart, schematic, table, etc.), visible objects and elements, "
+    "relationships between elements, and the likely purpose of this image.\n\n"
+    "EXTRACTED_TEXT: Extract ALL text visible in the image exactly as written. "
+    "Preserve the original text content. If no text is visible, write NONE."
 )
 
 STOPWORDS = {
@@ -38,42 +42,59 @@ STOPWORDS = {
 
 
 class LocalVisionCaptioner:
+    """Vision captioner using Qwen2-VL (primary) with BLIP fallback.
+
+    Qwen2-VL produces both a description and extracted text in a single
+    inference pass, removing the need for a separate OCR step.
+    """
+
     def __init__(self) -> None:
         self.logger = setup_logger()
         self.mode = "rule_based"
-        self.moondream_model = None
-        self.moondream_tokenizer = None
-        self.caption_pipeline = None
+        self._qwen_model = None
+        self._qwen_processor = None
+        self._caption_pipeline = None  # BLIP fallback
         self._initialized = False
+
+    # ------------------------------------------------------------------
+    # Lazy model loading
+    # ------------------------------------------------------------------
 
     def _init(self) -> None:
         if self._initialized:
             return
         self._initialized = True
 
-        # Preferred: moondream2 (trust_remote_code required by upstream repository).
+        # Primary: Qwen2-VL-2B-Instruct
         try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            import torch
+            from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
-            self.moondream_model = AutoModelForCausalLM.from_pretrained(
-                "vikhyatk/moondream2",
-                trust_remote_code=True,
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+            self._qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
+                "Qwen/Qwen2-VL-2B-Instruct",
+                torch_dtype=dtype,
+            ).to(device)
+            self._qwen_model.eval()
+
+            self._qwen_processor = AutoProcessor.from_pretrained(
+                "Qwen/Qwen2-VL-2B-Instruct",
             )
-            self.moondream_tokenizer = AutoTokenizer.from_pretrained(
-                "vikhyatk/moondream2",
-                trust_remote_code=True,
-            )
-            self.mode = "moondream2"
-            self.logger.info("Using vision model: moondream2")
+            self.mode = "qwen2vl"
+            self.logger.info("Using vision model: Qwen2-VL-2B-Instruct")
             return
         except Exception as exc:
-            self.logger.warning("moondream2 unavailable; fallback to BLIP pipeline. Reason: %s", exc)
+            self.logger.warning("Qwen2-VL unavailable; fallback to BLIP pipeline. Reason: %s", exc)
 
         # Fallback: BLIP image-to-text via transformers pipeline.
         try:
             from transformers import pipeline
 
-            self.caption_pipeline = pipeline("image-to-text", model="Salesforce/blip-image-captioning-base")
+            self._caption_pipeline = pipeline(
+                "image-to-text", model="Salesforce/blip-image-captioning-base"
+            )
             self.mode = "blip"
             self.logger.info("Using vision model fallback: BLIP")
             return
@@ -82,36 +103,114 @@ class LocalVisionCaptioner:
 
         self.mode = "rule_based"
 
-    def describe(self, image: Image.Image) -> str:
+    # ------------------------------------------------------------------
+    # Qwen2-VL inference
+    # ------------------------------------------------------------------
+
+    def _qwen_analyze(self, image: Image.Image) -> Tuple[str, str]:
+        """Run a single Qwen2-VL pass and return (description, extracted_text)."""
+        import torch
+        from qwen_vl_utils import process_vision_info
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": VISION_PROMPT},
+                ],
+            }
+        ]
+
+        text = self._qwen_processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = self._qwen_processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(self._qwen_model.device)
+
+        with torch.no_grad():
+            generated_ids = self._qwen_model.generate(**inputs, max_new_tokens=1024)
+
+        trimmed = [
+            out[len(inp) :] for inp, out in zip(inputs.input_ids, generated_ids)
+        ]
+        raw = self._qwen_processor.batch_decode(
+            trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0].strip()
+
+        return self._parse_response(raw)
+
+    # ------------------------------------------------------------------
+    # Response parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_response(response: str) -> Tuple[str, str]:
+        """Split a structured Qwen2-VL response into (description, extracted_text)."""
+        upper = response.upper()
+        for marker in ("EXTRACTED_TEXT:", "EXTRACTED TEXT:"):
+            idx = upper.find(marker)
+            if idx != -1:
+                desc_part = response[:idx].strip()
+                text_part = response[idx + len(marker) :].strip()
+
+                # Strip the DESCRIPTION: prefix if present
+                for prefix in ("DESCRIPTION:", "DESCRIPTION"):
+                    if desc_part.upper().startswith(prefix):
+                        desc_part = desc_part[len(prefix) :].strip()
+                        break
+
+                if text_part.upper().strip() in ("NONE", "NONE.", "N/A", "NO TEXT", "NO TEXT."):
+                    text_part = ""
+
+                return desc_part, text_part
+
+        # No marker found — treat the whole response as description.
+        return response.strip(), ""
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def analyze(self, image: Image.Image) -> Tuple[str, str]:
+        """Return *(description, extracted_text)* from a single model call.
+
+        * **Qwen2-VL**: one pass gives both fields.
+        * **BLIP fallback**: returns description only (extracted_text = "").
+        * **Rule-based**: returns ("", "").
+        """
         self._init()
-        if self.mode == "moondream2" and self.moondream_model is not None:
-            try:
-                if hasattr(self.moondream_model, "encode_image") and hasattr(
-                    self.moondream_model, "answer_question"
-                ):
-                    encoded = self.moondream_model.encode_image(image)
-                    answer = self.moondream_model.answer_question(
-                        encoded,
-                        VISION_PROMPT,
-                        self.moondream_tokenizer,
-                    )
-                    if isinstance(answer, str) and answer.strip():
-                        return answer.strip()
-                return ""
-            except Exception:
-                return ""
 
-        if self.mode == "blip" and self.caption_pipeline is not None:
+        if self.mode == "qwen2vl" and self._qwen_model is not None:
             try:
-                output = self.caption_pipeline(image)
+                return self._qwen_analyze(image)
+            except Exception as exc:
+                self.logger.warning("Qwen2-VL inference failed: %s", exc)
+                return "", ""
+
+        if self.mode == "blip" and self._caption_pipeline is not None:
+            try:
+                output = self._caption_pipeline(image)
                 if output and isinstance(output, list):
-                    text = output[0].get("generated_text", "").strip()
-                    return text
-                return ""
+                    desc = output[0].get("generated_text", "").strip()
+                    return desc, ""
+                return "", ""
             except Exception:
-                return ""
+                return "", ""
 
-        return ""
+        return "", ""
+
+    def describe(self, image: Image.Image) -> str:
+        """Backward-compatible wrapper — returns description only."""
+        desc, _ = self.analyze(image)
+        return desc
 
 
 @lru_cache(maxsize=1)
@@ -208,8 +307,11 @@ def enrich_extraction_with_metadata(result: ExtractionResult) -> ExtractionResul
             )
             continue
 
-        description = captioner.describe(image).strip()
-        ocr = _ocr_text(image)
+        description, vlm_ocr = captioner.analyze(image)
+        description = description.strip()
+        # Qwen2-VL extracts text in the same pass; fall back to Tesseract
+        # only when the VLM returned nothing (e.g. BLIP mode or failure).
+        ocr = vlm_ocr.strip() if vlm_ocr.strip() else _ocr_text(image)
         if not description:
             description = (
                 "Rule-based description: technical visual with extracted OCR and structural features only."
