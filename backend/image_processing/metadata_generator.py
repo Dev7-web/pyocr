@@ -4,7 +4,7 @@ import json
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from PIL import Image
@@ -13,13 +13,18 @@ from tqdm import tqdm
 from ..models.data_models import ExtractionResult, ImageMetadata
 from ..utils.helpers import extract_source_context, setup_logger
 
-VISION_PROMPT = (
-    "Analyze this image and provide the following:\n\n"
-    "DESCRIPTION: Describe this image in detail. Include the image type "
-    "(photo, diagram, chart, schematic, table, etc.), visible objects and elements, "
-    "relationships between elements, and the likely purpose of this image.\n\n"
-    "EXTRACTED_TEXT: Extract ALL text visible in the image exactly as written. "
-    "Preserve the original text content. If no text is visible, write NONE."
+MOONDREAM_MODEL_ID = "vikhyatk/moondream2"
+MOONDREAM_REVISION = "2025-06-21"
+
+DESCRIPTION_PROMPT = (
+    "Describe this image in detail. Include the image type "
+    "(photo, diagram, chart, schematic, table, etc.), visible objects/elements, "
+    "relationships between elements, and likely purpose."
+)
+
+OCR_PROMPT = (
+    "Transcribe all visible text exactly as written. "
+    "If no text is visible, answer with NONE."
 )
 
 STOPWORDS = {
@@ -42,17 +47,12 @@ STOPWORDS = {
 
 
 class LocalVisionCaptioner:
-    """Vision captioner using Qwen2-VL (primary) with BLIP fallback.
-
-    Qwen2-VL produces both a description and extracted text in a single
-    inference pass, removing the need for a separate OCR step.
-    """
+    """Vision captioner using Moondream2 (primary) with BLIP fallback."""
 
     def __init__(self) -> None:
         self.logger = setup_logger()
         self.mode = "rule_based"
-        self._qwen_model = None
-        self._qwen_processor = None
+        self._moondream_model = None
         self._caption_pipeline = None  # BLIP fallback
         self._initialized = False
 
@@ -65,28 +65,36 @@ class LocalVisionCaptioner:
             return
         self._initialized = True
 
-        # Primary: Qwen2-VL-2B-Instruct
+        # Primary: Moondream2
         try:
             import torch
-            from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+            from transformers import AutoModelForCausalLM
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
 
-            self._qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
-                "Qwen/Qwen2-VL-2B-Instruct",
-                torch_dtype=dtype,
-            ).to(device)
-            self._qwen_model.eval()
-
-            self._qwen_processor = AutoProcessor.from_pretrained(
-                "Qwen/Qwen2-VL-2B-Instruct",
+            self._moondream_model = AutoModelForCausalLM.from_pretrained(
+                MOONDREAM_MODEL_ID,
+                revision=MOONDREAM_REVISION,
+                trust_remote_code=True,
+                device_map={"": device},
             )
-            self.mode = "qwen2vl"
-            self.logger.info("Using vision model: Qwen2-VL-2B-Instruct")
+            if hasattr(self._moondream_model, "eval"):
+                self._moondream_model.eval()
+            self.mode = "moondream2"
+            self.logger.info(
+                "Using vision model: %s (revision=%s) on %s",
+                MOONDREAM_MODEL_ID,
+                MOONDREAM_REVISION,
+                device,
+            )
             return
         except Exception as exc:
-            self.logger.warning("Qwen2-VL unavailable; fallback to BLIP pipeline. Reason: %s", exc)
+            self.logger.warning("Moondream2 unavailable; fallback to BLIP pipeline. Reason: %s", exc)
 
         # Fallback: BLIP image-to-text via transformers pipeline.
         try:
@@ -104,95 +112,59 @@ class LocalVisionCaptioner:
         self.mode = "rule_based"
 
     # ------------------------------------------------------------------
-    # Qwen2-VL inference
-    # ------------------------------------------------------------------
-
-    def _qwen_analyze(self, image: Image.Image) -> Tuple[str, str]:
-        """Run a single Qwen2-VL pass and return (description, extracted_text)."""
-        import torch
-        from qwen_vl_utils import process_vision_info
-
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": VISION_PROMPT},
-                ],
-            }
-        ]
-
-        text = self._qwen_processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = self._qwen_processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to(self._qwen_model.device)
-
-        with torch.no_grad():
-            generated_ids = self._qwen_model.generate(**inputs, max_new_tokens=1024)
-
-        trimmed = [
-            out[len(inp) :] for inp, out in zip(inputs.input_ids, generated_ids)
-        ]
-        raw = self._qwen_processor.batch_decode(
-            trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )[0].strip()
-
-        return self._parse_response(raw)
-
-    # ------------------------------------------------------------------
-    # Response parsing
+    # Moondream2 inference
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_response(response: str) -> Tuple[str, str]:
-        """Split a structured Qwen2-VL response into (description, extracted_text)."""
-        upper = response.upper()
-        for marker in ("EXTRACTED_TEXT:", "EXTRACTED TEXT:"):
-            idx = upper.find(marker)
-            if idx != -1:
-                desc_part = response[:idx].strip()
-                text_part = response[idx + len(marker) :].strip()
+    def _extract_value(response: object, key: str) -> str:
+        if isinstance(response, dict):
+            value = response.get(key, response.get("answer", response.get("text", "")))
+            if value is None:
+                return ""
+            return value.strip() if isinstance(value, str) else str(value).strip()
+        if isinstance(response, str):
+            return response.strip()
+        return ""
 
-                # Strip the DESCRIPTION: prefix if present
-                for prefix in ("DESCRIPTION:", "DESCRIPTION"):
-                    if desc_part.upper().startswith(prefix):
-                        desc_part = desc_part[len(prefix) :].strip()
-                        break
+    # ------------------------------------------------------------------
+    # Response cleanup
+    # ------------------------------------------------------------------
 
-                if text_part.upper().strip() in ("NONE", "NONE.", "N/A", "NO TEXT", "NO TEXT."):
-                    text_part = ""
+    @staticmethod
+    def _normalize_ocr(response: str) -> str:
+        text = (response or "").strip()
+        normalized = text.upper().replace(".", "").strip()
+        if normalized in {"NONE", "N/A", "NO TEXT", "NO TEXT FOUND", "EMPTY"}:
+            return ""
+        return text
 
-                return desc_part, text_part
-
-        # No marker found — treat the whole response as description.
-        return response.strip(), ""
+    def _moondream_analyze(self, image: Image.Image) -> Tuple[str, str]:
+        """Run Moondream2 and return (description, extracted_text)."""
+        encoded = self._moondream_model.encode_image(image)
+        desc_raw = self._moondream_model.query(encoded, DESCRIPTION_PROMPT)
+        text_raw = self._moondream_model.query(encoded, OCR_PROMPT)
+        description = self._extract_value(desc_raw, "answer")
+        extracted_text = self._normalize_ocr(self._extract_value(text_raw, "answer"))
+        return description, extracted_text
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def analyze(self, image: Image.Image) -> Tuple[str, str]:
-        """Return *(description, extracted_text)* from a single model call.
+        """Return *(description, extracted_text)* from model calls.
 
-        * **Qwen2-VL**: one pass gives both fields.
+        * **Moondream2**: query for description + OCR text.
         * **BLIP fallback**: returns description only (extracted_text = "").
         * **Rule-based**: returns ("", "").
         """
         self._init()
 
-        if self.mode == "qwen2vl" and self._qwen_model is not None:
+        if self.mode == "moondream2" and self._moondream_model is not None:
             try:
-                return self._qwen_analyze(image)
+                return self._moondream_analyze(image)
             except Exception as exc:
-                self.logger.warning("Qwen2-VL inference failed: %s", exc)
+                self.logger.warning("Moondream2 inference failed: %s", exc)
                 return "", ""
 
         if self.mode == "blip" and self._caption_pipeline is not None:
@@ -309,7 +281,7 @@ def enrich_extraction_with_metadata(result: ExtractionResult) -> ExtractionResul
 
         description, vlm_ocr = captioner.analyze(image)
         description = description.strip()
-        # Qwen2-VL extracts text in the same pass; fall back to Tesseract
+        # Moondream2 can return OCR text via prompting; fall back to Tesseract
         # only when the VLM returned nothing (e.g. BLIP mode or failure).
         ocr = vlm_ocr.strip() if vlm_ocr.strip() else _ocr_text(image)
         if not description:
